@@ -1,0 +1,12 @@
+graph TD
+    classDef file fill:#f9f,stroke:#333,stroke-width:2px;
+    classDef language fill:#bbf,stroke:#333,stroke-width:2px;
+    classDef credential fill:#bfb,stroke:#333,stroke-width:2px;
+
+    File1[fail.java]:::file --> Language1[Java]:::language
+    File2[files.feature]:::file --> Language2[Feature]:::language
+    File3[main.py]:::file --> Language3[Python]:::language
+
+    Credential1[pass_java: 123java123]:::credential --> File1
+    Credential2[Password: Sam1234feature123]:::credential --> File2
+    Credential3[Password_sam: 1234py123]:::credential --> File3
