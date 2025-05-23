@@ -1,2 +1,1 @@
 This is test file 3.
-Random code: print('Hello from testfile3')
