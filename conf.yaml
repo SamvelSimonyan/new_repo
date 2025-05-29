@@ -1,0 +1,334 @@
+# GitLab CI/CD Pipeline Configuration
+# This pipeline includes build, test, security, and deployment stages
+
+# Global variables
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  NODE_VERSION: "18"
+  POSTGRES_DB: testdb
+  POSTGRES_USER: testuser
+  POSTGRES_PASSWORD: testpass
+  MAVEN_OPTS: "-Dmaven.repo.local=$CI_PROJECT_DIR/.m2/repository"
+  MAVEN_CLI_OPTS: "--batch-mode --errors --fail-at-end --show-version"
+
+# Define stages
+stages:
+  - validate
+  - build
+  - test
+  - security
+  - package
+  - deploy-staging
+  - integration-tests
+  - deploy-production
+  - cleanup
+
+# Cache configuration
+cache:
+  paths:
+    - node_modules/
+    - .m2/repository/
+    - target/
+
+# Before script for all jobs
+before_script:
+  - echo "Starting pipeline for commit $CI_COMMIT_SHA"
+  - export TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Validation Stage
+validate-yaml:
+  stage: validate
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache yamllint
+  script:
+    - yamllint -d relaxed .gitlab-ci.yml
+    - echo "YAML validation passed"
+  only:
+    - merge_requests
+    - main
+    - develop
+
+lint-dockerfile:
+  stage: validate
+  image: hadolint/hadolint:latest-debian
+  script:
+    - hadolint Dockerfile
+  allow_failure: true
+  only:
+    changes:
+      - Dockerfile
+
+# Build Stage
+build-frontend:
+  stage: build
+  image: node:${NODE_VERSION}-alpine
+  script:
+    - npm ci --prefer-offline --no-audit
+    - npm run build
+    - echo "Frontend build completed"
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 hour
+  only:
+    - main
+    - develop
+    - merge_requests
+
+build-backend:
+  stage: build
+  image: maven:3.8.4-openjdk-17
+  script:
+    - mvn $MAVEN_CLI_OPTS clean compile
+    - mvn $MAVEN_CLI_OPTS package -DskipTests
+    - echo "Backend build completed"
+  artifacts:
+    paths:
+      - target/*.jar
+    expire_in: 1 hour
+  only:
+    - main
+    - develop
+    - merge_requests
+
+# Test Stage
+unit-tests-frontend:
+  stage: test
+  image: node:${NODE_VERSION}-alpine
+  dependencies:
+    - build-frontend
+  script:
+    - npm ci --prefer-offline --no-audit
+    - npm run test:unit -- --coverage
+  coverage: '/Statements\s*:\s*([^%]+)/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+      junit: junit.xml
+    paths:
+      - coverage/
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+    - merge_requests
+
+unit-tests-backend:
+  stage: test
+  image: maven:3.8.4-openjdk-17
+  services:
+    - postgres:13-alpine
+  variables:
+    POSTGRES_HOST_AUTH_METHOD: trust
+  dependencies:
+    - build-backend
+  script:
+    - mvn $MAVEN_CLI_OPTS test
+  artifacts:
+    reports:
+      junit:
+        - target/surefire-reports/TEST-*.xml
+    paths:
+      - target/site/jacoco/
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+    - merge_requests
+
+integration-tests:
+  stage: test
+  image: docker:20.10.16
+  services:
+    - docker:20.10.16-dind
+  dependencies:
+    - build-frontend
+    - build-backend
+  script:
+    - docker-compose -f docker-compose.test.yml up --build -d
+    - sleep 30
+    - docker-compose -f docker-compose.test.yml exec -T app npm run test:integration
+    - docker-compose -f docker-compose.test.yml down
+  artifacts:
+    reports:
+      junit: integration-test-results.xml
+  only:
+    - main
+    - develop
+
+# Security Stage
+security-scan:
+  stage: security
+  image: owasp/zap2docker-stable
+  script:
+    - mkdir -p /zap/wrk/
+    - zap-baseline.py -t http://localhost:3000 -J gl-sast-report.json || true
+  artifacts:
+    reports:
+      sast: gl-sast-report.json
+    expire_in: 1 week
+  allow_failure: true
+  only:
+    - main
+    - develop
+
+dependency-check:
+  stage: security
+  image: owasp/dependency-check:latest
+  script:
+    - /usr/share/dependency-check/bin/dependency-check.sh 
+      --scan ./ 
+      --format JSON 
+      --out dependency-check-report.json
+      --suppression suppression.xml
+  artifacts:
+    paths:
+      - dependency-check-report.json
+    expire_in: 1 week
+  allow_failure: true
+  only:
+    - schedules
+    - main
+
+# Package Stage
+build-docker-image:
+  stage: package
+  image: docker:20.10.16
+  services:
+    - docker:20.10.16-dind
+  dependencies:
+    - build-frontend
+    - build-backend
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA .
+    - docker build -t $CI_REGISTRY_IMAGE:latest .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA
+    - docker push $CI_REGISTRY_IMAGE:latest
+  only:
+    - main
+    - develop
+
+# Staging Deployment
+deploy-staging:
+  stage: deploy-staging
+  image: alpine/helm:latest
+  environment:
+    name: staging
+    url: https://staging.example.com
+  dependencies:
+    - build-docker-image
+  before_script:
+    - apk add --no-cache curl
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+  script:
+    - kubectl config use-context staging
+    - helm upgrade --install myapp ./helm-chart 
+      --set image.tag=$CI_COMMIT_SHA 
+      --set environment=staging
+      --namespace staging
+    - kubectl rollout status deployment/myapp -n staging
+  only:
+    - develop
+  when: manual
+
+# Integration Tests in Staging
+staging-integration-tests:
+  stage: integration-tests
+  image: postman/newman:alpine
+  environment:
+    name: staging
+  dependencies:
+    - deploy-staging
+  script:
+    - newman run tests/api-tests.postman_collection.json 
+      --environment tests/staging.postman_environment.json
+      --reporters junit
+  artifacts:
+    reports:
+      junit: newman-results.xml
+  only:
+    - develop
+
+# Production Deployment
+deploy-production:
+  stage: deploy-production
+  image: alpine/helm:latest
+  environment:
+    name: production
+    url: https://production.example.com
+  dependencies:
+    - build-docker-image
+  before_script:
+    - apk add --no-cache curl
+    - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    - chmod +x kubectl && mv kubectl /usr/local/bin/
+  script:
+    - kubectl config use-context production
+    - helm upgrade --install myapp ./helm-chart 
+      --set image.tag=$CI_COMMIT_SHA 
+      --set environment=production
+      --set replicaCount=3
+      --namespace production
+    - kubectl rollout status deployment/myapp -n production
+  only:
+    - main
+  when: manual
+  allow_failure: false
+
+# Cleanup Stage
+cleanup-registry:
+  stage: cleanup
+  image: alpine:latest
+  script:
+    - echo "Cleaning up old Docker images from registry"
+    - apk add --no-cache curl jq
+    - |
+      # Keep only last 10 images
+      curl -H "Authorization: Bearer $CI_JOB_TOKEN" \
+           "$CI_API_V4_URL/projects/$CI_PROJECT_ID/registry/repositories" | \
+      jq -r '.[].location' | \
+      head -10
+  only:
+    - schedules
+  when: manual
+
+# Notification job
+notify-slack:
+  stage: cleanup
+  image: alpine:latest
+  script:
+    - apk add --no-cache curl
+    - |
+      curl -X POST -H 'Content-type: application/json' \
+      --data "{\"text\":\"🚀 Deployment completed for $CI_PROJECT_NAME - $CI_COMMIT_REF_NAME\"}" \
+      $SLACK_WEBHOOK_URL
+  when: on_success
+  only:
+    - main
+  allow_failure: true
+
+# Rules for different scenarios
+.rules-mr: &rules-mr
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+.rules-main: &rules-main
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+
+.rules-develop: &rules-develop
+  rules:
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+# Include external configurations
+include:
+  - local: '.gitlab-ci-security.yml'
+  - template: 'Security/SAST.gitlab-ci.yml'
+  - template: 'Security/Secret-Detection.gitlab-ci.yml'
